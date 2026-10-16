@@ -1,0 +1,9 @@
+name: t4-fresh
+on: [push]
+permissions:
+  contents: read
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo fresh
