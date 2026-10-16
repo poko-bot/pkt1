@@ -1,0 +1,11 @@
+name: t6-vars
+on: [push]
+permissions:
+  contents: read
+env:
+  _VARS: ${{ toJson(vars) }}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "$_VARS" | wc -c
