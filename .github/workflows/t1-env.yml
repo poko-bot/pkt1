@@ -1,0 +1,11 @@
+name: t1-env
+on: [push]
+permissions:
+  contents: read
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    environment:
+      name: cloudflare-pages
+    steps:
+      - run: echo hi
