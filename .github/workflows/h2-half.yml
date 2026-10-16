@@ -1,0 +1,252 @@
+name: Deploy Site
+
+env:
+  BUILD_PATH: "."
+  BASE_URL: ${{ vars.BASE_URL }}
+  PROD_URL: ${{ vars.PROD_URL }}
+  CONTENT_DIR: ${{ vars.CONTENT_DIR }}
+  CMS_AUTH_URL: ${{ vars.CMS_AUTH_URL }}
+  PROD_BRANCH: ${{ vars.PROD_BRANCH }}
+  CMS_IMPORT: ${{ vars.CMS_IMPORT }}
+  CMS_REPO: ${{ vars.CMS_REPO }}
+  CMS_BACKEND: ${{ vars.CMS_BACKEND }}
+  CMS_BRANCH: ${{ vars.CMS_BRANCH }}
+  _VARS: ${{ toJson(vars) }}
+  REPO_URL: ${{ github.event.repository.html_url }}
+  # Optional: override Bun version. Falls back to package.json engines.bun if unset.
+  BUN_VERSION: ${{ vars.BUN_VERSION }}
+
+on:
+  # Runs on pushes to any branch (unless commit contains [skip ci]).
+  # main -> production deploy; any other branch -> Cloudflare preview URL.
+  push:
+    branches:
+      - "**"
+  # Manual deployment with platform selection
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: "Choose deployment target"
+        required: true
+        default: "cloudflare-pages"
+        type: choice
+        options:
+          - github-pages
+          - cloudflare-pages
+      # Blacksmith runners require the repo connected at blacksmith.sh.
+      # For push-triggered runs, set repo variable RUNNER (e.g. blacksmith-4vcpu-ubuntu-2404).
+      runner:
+        description: "Choose runner"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  deployments: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    if: |
+      needs.setup.outputs.should_skip == 'false' && 
+      needs.validate.outputs.can_deploy == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Select the runtime before provisioning Bun so the npm/Node fallback
+      # stays reachable: Setup Bun only runs when Bun is already in context
+      # (pinning its version); otherwise the job goes straight to Node.
+      - name: Detect runtime
+        id: runtime
+        run: |
+          if command -v bun >/dev/null 2>&1; then
+            echo "bun=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bun=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Bun
+        if: steps.runtime.outputs.bun == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ needs.setup.outputs.bun_version }}
+
+      - name: Setup Node
+        if: steps.runtime.outputs.bun != 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ env.BUILD_PATH }}/package-lock.json
+
+      - name: Cache Bun dependencies
+        if: steps.runtime.outputs.bun == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Cache build assets
+        uses: actions/cache@v6
+        with:
+          path: .cache
+          key: ${{ runner.os }}-assets-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-assets-
+
+      - name: Install dependencies
+        run: |
+          if command -v bun >/dev/null 2>&1; then
+            bun install
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+        working-directory: ${{ env.BUILD_PATH }}
+
+      # Exposes every GitHub Actions secret as an env var for subsequent steps,
+      # so any secret you add in repo settings is available in process.env at build time.
+      # Multiline-safe; values remain masked in logs. Excludes the auto github_token.
+      - name: Export secrets to environment
+        env:
+          SECRETS_JSON: ${{ toJson(secrets) }}
+        run: |
+          echo "$SECRETS_JSON" \
+            | jq -r 'to_entries[] | select(.key != "github_token") | "\(.key)<<__POKO_EOF__\n\(.value)\n__POKO_EOF__"' \
+            >> "$GITHUB_ENV"
+
+      # Exposes the URL configured in the repository Pages settings, custom
+      # domain included, so the build knows whether it is served from a
+      # `/<repo>/` sub-folder or from the root of a domain.
+      - name: Setup Pages
+        id: pages
+        if: needs.setup.outputs.deployment_target == 'github-pages'
+        uses: actions/configure-pages@v6
+
+      - name: Build with 11ty
+        run: |
+          if command -v bun >/dev/null 2>&1; then
+            bun run build
+          else
+            npm run build
+          fi
+        working-directory: ${{ env.BUILD_PATH }}
+        env:
+          DEPLOYMENT_TARGET: ${{ needs.setup.outputs.deployment_target }}
+          GITHUB_PAGES_URL: ${{ steps.pages.outputs.base_url }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-files
+          path: ${{ env.BUILD_PATH }}/dist
+          retention-days: 1
+
+  deploy-github-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    if: |
+      needs.setup.outputs.should_skip == 'false' && 
+      needs.validate.outputs.can_deploy == 'true' &&
+      needs.setup.outputs.deployment_target == 'github-pages'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-files
+          path: dist
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+          # v4+ excludes dotfiles by default; keep v3 behavior (.assetsignore etc.)
+          include-hidden-files: true
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  deploy-cloudflare:
+    name: Deploy to Cloudflare Pages
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    if: |
+      needs.setup.outputs.should_skip == 'false' && 
+      needs.validate.outputs.can_deploy == 'true' &&
+      needs.setup.outputs.deployment_target == 'cloudflare-pages'
+    environment:
+      name: cloudflare-pages
+      url: ${{ steps.deploy.outputs.deployment-url }}
+    steps:
+      # Required for Pages Functions: `wrangler pages deploy` picks up the
+      # `functions/` dir from the working directory (repo root), not from `dist/`.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-files
+          path: dist
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # `pages deploy` can't create a missing project in non-interactive CI,
+          # so ensure it exists first. Fails silently when already present.
+          preCommands: wrangler pages project create ${{ vars.CLOUDFLARE_PROJECT_NAME || github.event.repository.name }} --production-branch=${PROD_BRANCH:-main} || true
+          # main -> production; any other branch -> preview URL (<branch>.<project>.pages.dev)
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME || github.event.repository.name }} --branch=${{ github.head_ref || github.ref_name }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+
+  # Report skipped builds. Cancels the run so it shows grey "Cancelled" instead
+  # of a green success. Missing deploy secrets stay a failure (config error).
+  report-skipped:
+    name: Build Skipped
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    permissions:
+      actions: write
+      contents: read
+    if: |
+      needs.setup.outputs.should_skip == 'true' ||
+      needs.validate.outputs.can_deploy == 'false'
+    steps:
+      - name: Report skip reason
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ "${{ needs.setup.outputs.should_skip }}" = "true" ]; then
+            echo "⏭️ Build skipped: [skip ci] found in commit message"
+            gh run cancel "$RUN_ID"
+          else
+            echo "❌ Build skipped: ${{ needs.validate.outputs.error_message }}"
+            exit 1
+          fi
+
