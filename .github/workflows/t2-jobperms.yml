@@ -1,0 +1,13 @@
+name: t2-jobperms
+on: [push]
+permissions:
+  contents: read
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      deployments: write
+    steps:
+      - run: echo hi
