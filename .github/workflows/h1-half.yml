@@ -1,0 +1,172 @@
+name: Deploy Site
+
+env:
+  BUILD_PATH: "."
+  BASE_URL: ${{ vars.BASE_URL }}
+  PROD_URL: ${{ vars.PROD_URL }}
+  CONTENT_DIR: ${{ vars.CONTENT_DIR }}
+  CMS_AUTH_URL: ${{ vars.CMS_AUTH_URL }}
+  PROD_BRANCH: ${{ vars.PROD_BRANCH }}
+  CMS_IMPORT: ${{ vars.CMS_IMPORT }}
+  CMS_REPO: ${{ vars.CMS_REPO }}
+  CMS_BACKEND: ${{ vars.CMS_BACKEND }}
+  CMS_BRANCH: ${{ vars.CMS_BRANCH }}
+  _VARS: ${{ toJson(vars) }}
+  REPO_URL: ${{ github.event.repository.html_url }}
+  # Optional: override Bun version. Falls back to package.json engines.bun if unset.
+  BUN_VERSION: ${{ vars.BUN_VERSION }}
+
+on:
+  # Runs on pushes to any branch (unless commit contains [skip ci]).
+  # main -> production deploy; any other branch -> Cloudflare preview URL.
+  push:
+    branches:
+      - "**"
+  # Manual deployment with platform selection
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: "Choose deployment target"
+        required: true
+        default: "cloudflare-pages"
+        type: choice
+        options:
+          - github-pages
+          - cloudflare-pages
+      # Blacksmith runners require the repo connected at blacksmith.sh.
+      # For push-triggered runs, set repo variable RUNNER (e.g. blacksmith-4vcpu-ubuntu-2404).
+      runner:
+        description: "Choose runner"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  deployments: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    name: Setup Deployment
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    outputs:
+      should_skip: ${{ steps.check.outputs.should_skip }}
+      deployment_target: ${{ steps.target.outputs.deployment_target }}
+      bun_version: ${{ steps.bun.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check for [skip ci] in commit message
+        id: check
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [[ "$HEAD_COMMIT_MESSAGE" == *"[skip ci]"* ]]; then
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+            echo "Found [skip ci] in commit message, skipping workflow"
+          else
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine deployment target
+        id: target
+        if: steps.check.outputs.should_skip == 'false'
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "deployment_target=${{ github.event.inputs.deployment_target }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_name }}" != "main" ]; then
+            # Non-main branches only produce Cloudflare preview deployments
+            echo "deployment_target=cloudflare-pages" >> "$GITHUB_OUTPUT"
+          else
+            # main: default to cloudflare-pages when CF secrets are set, else github-pages
+            if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ACCOUNT_ID" ]; then
+              echo "deployment_target=cloudflare-pages" >> "$GITHUB_OUTPUT"
+            else
+              echo "deployment_target=github-pages" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Get Bun version
+        id: bun
+        if: steps.check.outputs.should_skip == 'false'
+        run: |
+          if [ -n "$BUN_VERSION" ]; then
+            echo "version=$BUN_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            # Read from package.json engines.bun (strip any leading >=, ^, ~)
+            VERSION=$(jq -r '.engines.bun' package.json | sed 's/[>=~^]//g')
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Escape hatch: a selected runner label that never picks up (e.g. Blacksmith
+  # requested on a repo that isn't connected) leaves jobs queued until GitHub's
+  # 24h self-hosted queue ceiling. This job runs on ubuntu-latest, waits, and
+  # cancels the run if nothing ever started. Only runs for non-default runners.
+  watchdog:
+    name: Runner Watchdog
+    if: ${{ (inputs.runner || vars.RUNNER || 'ubuntu-latest') != 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel run if the selected runner never picked up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          sleep 300
+          STARTED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.name != "Runner Watchdog") | select(.status == "in_progress" or .status == "completed")] | length')
+          if [ "$STARTED" -eq 0 ]; then
+            echo "::error::No job started within 5min - runner label unavailable. Rerun with runner=ubuntu-latest or fix the Blacksmith connection."
+            gh run cancel "$RUN_ID" || true
+          fi
+
+  # Validate required secrets and configurations
+  validate:
+    name: Validate Configuration
+    needs: setup
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    if: needs.setup.outputs.should_skip == 'false'
+    outputs:
+      can_deploy: ${{ steps.validate.outputs.can_deploy }}
+      error_message: ${{ steps.validate.outputs.error_message }}
+    steps:
+      - name: Validate deployment configuration
+        id: validate
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          TARGET="${{ needs.setup.outputs.deployment_target }}"
+          CAN_DEPLOY="true"
+          ERROR_MSG=""
+
+          if [ "$TARGET" = "cloudflare-pages" ]; then
+            if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ACCOUNT_ID" ]; then
+              CAN_DEPLOY="false"
+              ERROR_MSG="Missing Cloudflare secrets: CLOUDFLARE_API_TOKEN and/or CLOUDFLARE_ACCOUNT_ID"
+            fi
+          elif [ "$TARGET" = "github-pages" ]; then
+            # GitHub Pages doesn't require additional secrets
+            echo "GitHub Pages deployment configuration is valid"
+          fi
+
+          echo "can_deploy=$CAN_DEPLOY" >> "$GITHUB_OUTPUT"
+          echo "error_message=$ERROR_MSG" >> "$GITHUB_OUTPUT"
+
