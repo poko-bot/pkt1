@@ -1,0 +1,80 @@
+name: Deploy Site
+
+env:
+  BUILD_PATH: "."
+  BASE_URL: ${{ vars.BASE_URL }}
+  PROD_URL: ${{ vars.PROD_URL }}
+  CONTENT_DIR: ${{ vars.CONTENT_DIR }}
+  CMS_AUTH_URL: ${{ vars.CMS_AUTH_URL }}
+  PROD_BRANCH: ${{ vars.PROD_BRANCH }}
+  CMS_IMPORT: ${{ vars.CMS_IMPORT }}
+  CMS_REPO: ${{ vars.CMS_REPO }}
+  CMS_BACKEND: ${{ vars.CMS_BACKEND }}
+  CMS_BRANCH: ${{ vars.CMS_BRANCH }}
+  _VARS: ${{ toJson(vars) }}
+  REPO_URL: ${{ github.event.repository.html_url }}
+  # Optional: override Bun version. Falls back to package.json engines.bun if unset.
+  BUN_VERSION: ${{ vars.BUN_VERSION }}
+
+on:
+  # Runs on pushes to any branch (unless commit contains [skip ci]).
+  # main -> production deploy; any other branch -> Cloudflare preview URL.
+  push:
+    branches:
+      - "**"
+  # Manual deployment with platform selection
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: "Choose deployment target"
+        required: true
+        default: "cloudflare-pages"
+        type: choice
+        options:
+          - github-pages
+          - cloudflare-pages
+      # Blacksmith runners require the repo connected at blacksmith.sh.
+      # For push-triggered runs, set repo variable RUNNER (e.g. blacksmith-4vcpu-ubuntu-2404).
+      runner:
+        description: "Choose runner"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  deployments: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  report-skipped:
+    name: Build Skipped
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    permissions:
+      actions: write
+      contents: read
+    if: |
+      needs.setup.outputs.should_skip == 'true' ||
+      needs.validate.outputs.can_deploy == 'false'
+    steps:
+      - name: Report skip reason
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ "${{ needs.setup.outputs.should_skip }}" = "true" ]; then
+            echo "⏭️ Build skipped: [skip ci] found in commit message"
+            gh run cancel "$RUN_ID"
+          else
+            echo "❌ Build skipped: ${{ needs.validate.outputs.error_message }}"
+            exit 1
+          fi
+
