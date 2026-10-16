@@ -1,0 +1,126 @@
+name: Deploy Site
+
+env:
+  BUILD_PATH: "."
+  BASE_URL: ${{ vars.BASE_URL }}
+  PROD_URL: ${{ vars.PROD_URL }}
+  CONTENT_DIR: ${{ vars.CONTENT_DIR }}
+  CMS_AUTH_URL: ${{ vars.CMS_AUTH_URL }}
+  PROD_BRANCH: ${{ vars.PROD_BRANCH }}
+  CMS_IMPORT: ${{ vars.CMS_IMPORT }}
+  CMS_REPO: ${{ vars.CMS_REPO }}
+  CMS_BACKEND: ${{ vars.CMS_BACKEND }}
+  CMS_BRANCH: ${{ vars.CMS_BRANCH }}
+  _VARS: ${{ toJson(vars) }}
+  REPO_URL: ${{ github.event.repository.html_url }}
+  # Optional: override Bun version. Falls back to package.json engines.bun if unset.
+  BUN_VERSION: ${{ vars.BUN_VERSION }}
+
+on:
+  # Runs on pushes to any branch (unless commit contains [skip ci]).
+  # main -> production deploy; any other branch -> Cloudflare preview URL.
+  push:
+    branches:
+      - "**"
+  # Manual deployment with platform selection
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: "Choose deployment target"
+        required: true
+        default: "cloudflare-pages"
+        type: choice
+        options:
+          - github-pages
+          - cloudflare-pages
+      # Blacksmith runners require the repo connected at blacksmith.sh.
+      # For push-triggered runs, set repo variable RUNNER (e.g. blacksmith-4vcpu-ubuntu-2404).
+      runner:
+        description: "Choose runner"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  deployments: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-github-pages:
+    name: Deploy to GitHub Pages
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    if: |
+      needs.setup.outputs.should_skip == 'false' && 
+      needs.validate.outputs.can_deploy == 'true' &&
+      needs.setup.outputs.deployment_target == 'github-pages'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-files
+          path: dist
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+          # v4+ excludes dotfiles by default; keep v3 behavior (.assetsignore etc.)
+          include-hidden-files: true
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  deploy-cloudflare:
+    name: Deploy to Cloudflare Pages
+    runs-on: ${{ inputs.runner || vars.RUNNER || 'ubuntu-latest' }}
+    if: |
+      needs.setup.outputs.should_skip == 'false' && 
+      needs.validate.outputs.can_deploy == 'true' &&
+      needs.setup.outputs.deployment_target == 'cloudflare-pages'
+    environment:
+      name: cloudflare-pages
+      url: ${{ steps.deploy.outputs.deployment-url }}
+    steps:
+      # Required for Pages Functions: `wrangler pages deploy` picks up the
+      # `functions/` dir from the working directory (repo root), not from `dist/`.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-files
+          path: dist
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # `pages deploy` can't create a missing project in non-interactive CI,
+          # so ensure it exists first. Fails silently when already present.
+          preCommands: wrangler pages project create ${{ vars.CLOUDFLARE_PROJECT_NAME || github.event.repository.name }} --production-branch=${PROD_BRANCH:-main} || true
+          # main -> production; any other branch -> preview URL (<branch>.<project>.pages.dev)
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME || github.event.repository.name }} --branch=${{ github.head_ref || github.ref_name }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+
+  # Report skipped builds. Cancels the run so it shows grey "Cancelled" instead
+  # of a green success. Missing deploy secrets stay a failure (config error).
