@@ -1,0 +1,9 @@
+name: probe
+on: [push]
+permissions:
+  contents: read
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
